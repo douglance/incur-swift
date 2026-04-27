@@ -224,3 +224,92 @@ public func parseFetchArgv(_ argv: [String]) -> FetchInput {
 public func isStreamingResponse(contentType: String?) -> Bool {
     contentType == "application/x-ndjson"
 }
+
+// MARK: - Cli.fetch types
+
+/// Response returned by `Cli.fetch(_:)`.
+///
+/// Mirrors the TS `Response` shape returned from `cli.fetch` (Cli.ts:263–274).
+/// We use a lightweight struct rather than `URLResponse` because Foundation's
+/// `URLResponse` cannot carry a body — it represents only metadata. Consumers
+/// that need a Foundation response can construct an `HTTPURLResponse` from the
+/// `status` and `headers` fields and pair it with `body.toJSON()` data.
+public struct FetchResponse: Sendable {
+    /// HTTP status code (200, 404, 500, etc.).
+    public let status: Int
+    /// Response headers (lower-cased keys recommended for case-insensitive lookup).
+    public let headers: [String: String]
+    /// JSON-shaped response body.
+    public let body: JSONValue
+
+    public init(status: Int, headers: [String: String] = [:], body: JSONValue = .null) {
+        self.status = status
+        self.headers = headers
+        self.body = body
+    }
+
+    /// Returns the body serialized as compact JSON `Data`.
+    public func bodyData() -> Data {
+        body.toJSON(pretty: false).data(using: .utf8) ?? Data()
+    }
+}
+
+/// Internal: resolved command for `Cli.fetch(_:)`.
+enum FetchResolved {
+    case leaf(command: CommandDef, path: String, trailingArgs: [String])
+    case gateway(handler: any FetchHandler, options: FetchGatewayOptions, path: String)
+    case notFound(attempted: String)
+    case noRoot
+}
+
+/// Walks the command tree using URL path segments, returning the resolved
+/// leaf or gateway. Trailing path segments after a matched leaf become
+/// positional args. An empty path resolves to the root command if defined.
+func resolveFetchCommand(
+    commands: [String: CommandEntry],
+    tokens: [String],
+    rootCommand: CommandDef?,
+    cliName: String
+) -> FetchResolved {
+    if tokens.isEmpty {
+        if let root = rootCommand {
+            return .leaf(command: root, path: cliName, trailingArgs: [])
+        }
+        return .noRoot
+    }
+
+    var currentCommands = commands
+    var pathParts: [String] = []
+    var idx = 0
+
+    while idx < tokens.count {
+        let token = tokens[idx]
+        guard let entry = currentCommands[token] else {
+            // Unknown token at the first position is "command not found".
+            // Otherwise: treat the unmatched tail as positional args for the
+            // last resolved command.
+            if pathParts.isEmpty {
+                return .notFound(attempted: token)
+            }
+            // No leaf was matched along the way (we're inside a group with
+            // unknown subcommand) — treat as not found.
+            return .notFound(attempted: token)
+        }
+
+        pathParts.append(token)
+
+        switch entry {
+        case .leaf(let def):
+            let trailing = Array(tokens.dropFirst(idx + 1))
+            return .leaf(command: def, path: pathParts.joined(separator: " "), trailingArgs: trailing)
+        case .fetchGateway(let handler, let opts):
+            return .gateway(handler: handler, options: opts, path: pathParts.joined(separator: " "))
+        case .group(_, let subCommands, _, _):
+            currentCommands = subCommands
+            idx += 1
+        }
+    }
+
+    // Walked the whole tree but never hit a leaf — group reached, no command.
+    return .notFound(attempted: tokens.last ?? "")
+}

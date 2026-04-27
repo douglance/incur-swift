@@ -1,12 +1,40 @@
 # Incur
 
-A Swift framework for building CLIs that work for both AI agents and humans.
+A Swift framework for building CLIs that work for both AI agents and humans. Swift port of the upstream TypeScript [incur](https://github.com/wevm/incur).
 
 Define your commands once. Incur serves them over three transports:
 
 - **CLI** — standard argv parsing with flags, options, positional args
 - **MCP** — Model Context Protocol stdio server for AI coding agents
 - **HTTP** — JSON API server (bring your own HTTP framework)
+
+## Status
+
+`0.3.x` parity with upstream TypeScript `incur` is in progress. Some features land here and in incur-swift in parallel; the table below reflects what's wired today. See `AGENTS.md` and `SKILL.md` for the per-feature surface, and the upstream [`incurs/CHANGELOG.md`](https://github.com/wevm/incur/blob/main/CHANGELOG.md) for the canonical feature list.
+
+| Feature | Status |
+|---------|--------|
+| CLI parsing (args, options, flags, `-abc`, `-vvv`) | Done |
+| Three transports (CLI, HTTP, MCP) | Done |
+| Help (`--help`, `--version`) | Done |
+| Output formats (`--json`, `--format`, `--verbose`) | Done |
+| Output filtering (`--filter-output`) | In progress |
+| Token pagination (`--token-count`, `--token-limit`, `--token-offset`) | In progress |
+| Streaming (`AsyncStream<JSONValue>`) | Done |
+| Middleware (onion-style, `@Sendable`) | Done |
+| Vars / typed dependency injection | In progress |
+| Usage patterns (alternative `--help` synopses) | In progress |
+| Sync config (`Cli.sync(...)` / `skills add`) | In progress |
+| Shell completions (bash/zsh/fish/nushell) | Done |
+| Agent discovery (21 agents) | Done |
+| Skill file generation (`--llms`, `--llms-full`, `skills add`) | Done |
+| MCP registration (`mcp add`) | Done |
+| TOON output format | Done |
+| Config file loading | Done |
+| OpenAPI gateway (`generateCommands(spec:)`) | In progress |
+| `cli.fetch(req:)` HTTP entrypoint | In progress |
+| Type generation | Macros (`@IncurArgs`, `@IncurOptions`, `@IncurEnv`) |
+| Derive macros (`IncurArgs`, `IncurOptions`, `IncurEnv`) | Done |
 
 ## Install
 
@@ -338,10 +366,30 @@ CLIs can load defaults from JSON config files:
 
 Use `--config-schema` to generate JSON Schema for editor autocompletion.
 
+## Platforms
+
+incur-swift ships for the full Apple platform matrix:
+
+- macOS 13+
+- iOS 18+
+- tvOS 17+
+- visionOS 2+
+
+The `Package.swift` manifest declares each platform explicitly:
+
+```swift
+platforms: [
+    .macOS(.v13),
+    .iOS(.v18),
+    .tvOS(.v17),
+    .visionOS(.v2),
+]
+```
+
 ## Requirements
 
 - Swift 6.0+
-- macOS 13+
+- An Apple platform from the matrix above (Linux/Windows are not currently supported)
 
 ## License
 

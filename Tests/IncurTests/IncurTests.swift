@@ -869,11 +869,12 @@ struct ConfigSchemaTests {
 
 @Suite("TokenOperations")
 struct TokenOperationsTests {
-    @Test func tokenCount() {
-        // 20 characters -> 5 tokens (20/4)
-        let text = "12345678901234567890"
-        let result = applyTokenOperations(text, count: true, limit: nil, offset: nil)
-        #expect(result == "5")
+    @Test func tokenCountWords() {
+        // "hello world" → segments ["hello", " ", "world"]. Each non-whitespace
+        // segment > short threshold and ≤ 6 chars → ceil(len/6) = 1 token each.
+        // Total: 2 tokens.
+        let result = applyTokenOperations("hello world", count: true, limit: nil, offset: nil)
+        #expect(result == "2")
     }
 
     @Test func tokenCountEmpty() {
@@ -881,37 +882,42 @@ struct TokenOperationsTests {
         #expect(result == "0")
     }
 
-    @Test func tokenLimit() {
-        // 40 chars = 10 tokens. Limit to 5 tokens = first 20 chars.
-        let text = "1234567890123456789012345678901234567890"
-        let result = applyTokenOperations(text, count: false, limit: 5, offset: nil)
-        #expect(result.count == 20)
-        #expect(result == "12345678901234567890")
+    @Test func tokenCountNumeric() {
+        // A pure numeric run is a single token regardless of length.
+        let result = applyTokenOperations("1234567890123456789012345678901234567890", count: true, limit: nil, offset: nil)
+        #expect(result == "1")
     }
 
-    @Test func tokenOffset() {
-        // 40 chars = 10 tokens. Offset 2 tokens = skip first 8 chars.
-        let text = "1234567890123456789012345678901234567890"
-        let result = applyTokenOperations(text, count: false, limit: nil, offset: 2)
-        #expect(result.count == 32)
-        #expect(result == "90123456789012345678901234567890")
+    @Test func tokenLimitTruncatesAndAppendsSummary() {
+        // Six 6-char words → 6 tokens. Limit 3 → first three words plus
+        // their trailing whitespace, then truncation summary.
+        let text = "alpha bravo charl delta echof foxtr"
+        let result = applyTokenOperations(text, count: false, limit: 3, offset: nil)
+        #expect(result.contains("alpha"))
+        #expect(result.contains("[truncated: showing tokens 0-3 of 6]"))
+        #expect(!result.contains("foxtr"))
     }
 
-    @Test func tokenOffsetAndLimit() {
-        // 40 chars. Offset 2 tokens (8 chars), limit 3 tokens (12 chars).
-        let text = "1234567890123456789012345678901234567890"
-        let result = applyTokenOperations(text, count: false, limit: 3, offset: 2)
-        #expect(result.count == 12)
-        #expect(result == "901234567890")
+    @Test func tokenOffsetSkipsLeadingTokens() {
+        let text = "alpha bravo charl delta echof foxtr"
+        let result = applyTokenOperations(text, count: false, limit: nil, offset: 3)
+        #expect(!result.contains("alpha"))
+        #expect(result.contains("delta"))
+        #expect(result.contains("[truncated: showing tokens 3-6 of 6]"))
     }
 
-    @Test func tokenOffsetBeyondEnd() {
-        let text = "short"
-        let result = applyTokenOperations(text, count: false, limit: nil, offset: 100)
-        #expect(result == "")
+    @Test func tokenOffsetAndLimitPaginate() {
+        let text = "alpha bravo charl delta echof foxtr"
+        let result = applyTokenOperations(text, count: false, limit: 2, offset: 2)
+        // tokens 2-4 → "charl delta"
+        #expect(result.contains("charl"))
+        #expect(result.contains("delta"))
+        #expect(!result.contains("alpha"))
+        #expect(!result.contains("foxtr"))
+        #expect(result.contains("[truncated: showing tokens 2-4 of 6]"))
     }
 
-    @Test func tokenLimitBeyondLength() {
+    @Test func tokenLimitBeyondLengthLeavesTextUntouched() {
         let text = "short"
         let result = applyTokenOperations(text, count: false, limit: 100, offset: nil)
         #expect(result == "short")

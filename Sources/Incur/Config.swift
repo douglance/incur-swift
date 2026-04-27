@@ -136,7 +136,9 @@ public func extractCommandSection(config: JSONValue, cliName: String, commandPat
 /// Resolves a file path, expanding `~` to the user's home directory.
 private func resolvePath(_ filePath: String) -> String {
     if filePath.hasPrefix("~/") || filePath == "~" {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        // `FileManager.homeDirectoryForCurrentUser` is unavailable on iOS/tvOS/visionOS;
+        // `NSHomeDirectory()` returns the sandbox home there and the real home on macOS.
+        let home = NSHomeDirectory()
         return home + String(filePath.dropFirst(1))
     }
 

@@ -74,6 +74,13 @@ public final class MutableVars: @unchecked Sendable {
         defer { lock.unlock() }
         return .object(storage)
     }
+
+    /// Returns a snapshot of the underlying ordered map (for validation).
+    public func snapshotMap() -> OrderedMap {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
 }
 
 /// A middleware handler function.

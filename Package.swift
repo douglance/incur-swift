@@ -7,6 +7,9 @@ let package = Package(
     name: "Incur",
     platforms: [
         .macOS(.v13),
+        .iOS(.v18),
+        .tvOS(.v17),
+        .visionOS(.v2),
     ],
     products: [
         .library(
@@ -35,6 +38,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "IncurExample",
+            dependencies: ["Incur"]
+        ),
+        .executableTarget(
+            name: "IncurGen",
             dependencies: ["Incur"]
         ),
         .testTarget(

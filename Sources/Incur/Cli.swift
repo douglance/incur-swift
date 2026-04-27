@@ -48,6 +48,33 @@ public struct ConfigOptions: Sendable {
     }
 }
 
+/// Configuration for `Cli.sync(...)` builder — controls the built-in
+/// `<cli> skills add` command's behavior. Mirrors TS `Cli.create({ sync: ... })`
+/// (Cli.ts:418–422). Values populate `SyncOptions` when `installSkills`
+/// runs through `serve`'s `skills add` handler.
+public struct CliSyncOptions: Sendable {
+    /// Working directory for resolving include globs. Defaults to package root.
+    public let cwd: URL?
+    /// Default grouping depth for skill files. Overridden by `--depth`.
+    public let depth: Int?
+    /// Glob patterns for directories containing additional SKILL.md files.
+    public let include: [String]?
+    /// Example prompts shown after sync to help users get started.
+    public let suggestions: [String]?
+
+    public init(
+        cwd: URL? = nil,
+        depth: Int? = nil,
+        include: [String]? = nil,
+        suggestions: [String]? = nil
+    ) {
+        self.cwd = cwd
+        self.depth = depth
+        self.include = include
+        self.suggestions = suggestions
+    }
+}
+
 /// The main CLI builder and executor.
 public final class Cli: @unchecked Sendable {
     public let name: String
@@ -62,6 +89,7 @@ public final class Cli: @unchecked Sendable {
     public var config: ConfigOptions?
     public var outputPolicy: OutputPolicy?
     public var defaultFormat: Format?
+    public var syncOptions: CliSyncOptions?
 
     public init(_ name: String) {
         self.name = name
@@ -105,6 +133,37 @@ public final class Cli: @unchecked Sendable {
         return self
     }
 
+    /// Registers a typed command group derived from an OpenAPI 3.x spec.
+    ///
+    /// Mirrors the TS overload `command(name, { openapi, fetch, basePath, description })`
+    /// (Cli.ts:215–231). Walks the spec's `paths`, generates one subcommand per
+    /// operation, and mounts them as a group under `name`. Path parameters
+    /// become positional args; query and request body fields become options.
+    /// Each generated handler interpolates the URL template, builds the request,
+    /// and invokes `fetch` to execute it.
+    @discardableResult
+    public func command(
+        _ name: String,
+        openapi spec: JSONValue,
+        fetch: @escaping OpenApiFetchFn,
+        basePath: String? = nil,
+        description: String? = nil,
+        outputPolicy: OutputPolicy? = nil
+    ) -> Cli {
+        let generated = generateCommands(
+            spec: spec,
+            fetchFn: fetch,
+            options: GenerateOptions(basePath: basePath)
+        )
+        self.commands[name] = .group(
+            description: description,
+            commands: generated,
+            middleware: [],
+            outputPolicy: outputPolicy
+        )
+        return self
+    }
+
     @discardableResult
     public func fetchGateway(_ name: String, handler: any FetchHandler, options: FetchGatewayOptions = FetchGatewayOptions()) -> Cli {
         self.commands[name] = .fetchGateway(handler: handler, options: options)
@@ -129,6 +188,58 @@ public final class Cli: @unchecked Sendable {
     @discardableResult
     public func useMiddleware(_ handler: @escaping MiddlewareFn) -> Cli {
         self.middlewareHandlers.append(handler)
+        return self
+    }
+
+    /// Declares the schema for middleware-populated variables. Each `FieldMeta`
+    /// in `fields` defines a name, type, optional default, and `required` flag.
+    /// Defaults are seeded into `MutableVars` before middleware runs; required
+    /// fields without a value after middleware completes produce a
+    /// `VALIDATION_ERROR`. Mirrors the TS `vars` schema field on `Cli.create`.
+    @discardableResult
+    public func vars(_ fields: [FieldMeta]) -> Cli {
+        self.varsFields = fields
+        return self
+    }
+
+    /// Declares the schema for CLI-level environment variables. Each `FieldMeta`
+    /// in `fields` defines a Swift name, the OS env-var name (via `envName`),
+    /// type, optional default, and `required` flag. Values are read from the
+    /// process environment (or the supplied `envSource` for tests), coerced to
+    /// the declared type, and validated BEFORE middleware runs — required
+    /// fields without a value or coercion failures produce a `VALIDATION_ERROR`
+    /// with `path: "env.<name>"`. The parsed map is exposed to middleware via
+    /// `MiddlewareContext.env` and to handlers via `CommandContext.env`,
+    /// merged with any command-level `envFields` (command-level wins on
+    /// conflict). Mirrors the TS `envSchema` field on `Cli.create`.
+    @discardableResult
+    public func env(_ fields: [FieldMeta]) -> Cli {
+        self.envFields = fields
+        return self
+    }
+
+    /// Configures the built-in `<cli> skills add` command. Mirrors the TS
+    /// `Cli.create({ sync: ... })` parity (Cli.ts:418–422). Values are threaded
+    /// into `SyncOptions` when `serveWith` handles `skills add`.
+    @discardableResult
+    public func sync(
+        cwd: URL? = nil,
+        depth: Int? = nil,
+        include: [String]? = nil,
+        suggestions: [String]? = nil
+    ) -> Cli {
+        self.syncOptions = CliSyncOptions(
+            cwd: cwd,
+            depth: depth,
+            include: include,
+            suggestions: suggestions
+        )
+        return self
+    }
+
+    @discardableResult
+    public func sync(_ options: CliSyncOptions) -> Cli {
+        self.syncOptions = options
         return self
     }
 
@@ -258,8 +369,8 @@ public final class Cli: @unchecked Sendable {
 
             let rest = Array(builtin.rest.dropFirst(2))
 
-            // Parse --depth
-            var depth = 1
+            // Parse --depth (CLI flag wins over Cli.sync(depth:) default)
+            var depth = syncOptions?.depth ?? 1
             if let depthIdx = rest.firstIndex(of: "--depth") {
                 if depthIdx + 1 < rest.count, let d = Int(rest[depthIdx + 1]) {
                     depth = d
@@ -280,15 +391,24 @@ public final class Cli: @unchecked Sendable {
                     name: name,
                     commands: skillCommands,
                     options: SyncOptions(
+                        cwd: syncOptions?.cwd,
                         depth: depth,
                         description: cliDescription,
-                        global: !noGlobal
+                        global: !noGlobal,
+                        include: syncOptions?.include
                     )
                 )
 
                 var lines = ["Synced \(result.skills.count) skill\(result.skills.count == 1 ? "" : "s")"]
                 for skill in result.skills {
                     lines.append("  \(skill.name)")
+                }
+                if let suggestions = syncOptions?.suggestions, !suggestions.isEmpty {
+                    lines.append("")
+                    lines.append("Try:")
+                    for suggestion in suggestions {
+                        lines.append("  \(suggestion)")
+                    }
                 }
                 writelnStdout(lines.joined(separator: "\n"))
 
@@ -480,6 +600,7 @@ public final class Cli: @unchecked Sendable {
                         description: command.description,
                         envFields: command.envFields,
                         examples: command.examples,
+                        usage: command.usage,
                         hint: command.hint,
                         optionsFields: command.optionsFields,
                         optionAliases: command.aliases,
@@ -598,6 +719,7 @@ public final class Cli: @unchecked Sendable {
                     name: name,
                     parseMode: .argv,
                     path: path,
+                    varsFields: varsFields,
                     version: version
                 )
             )
@@ -700,6 +822,211 @@ public final class Cli: @unchecked Sendable {
         }
     }
 
+    // MARK: - Fetch Handler
+
+    /// Exposes the CLI as a Fetch-compatible handler.
+    ///
+    /// Mirrors the TS `cli.fetch(req: Request)` (Cli.ts:263–274). Routes the
+    /// request through the registered command tree:
+    /// - Path segments resolve to a command path; trailing segments after the
+    ///   resolved command become positional args.
+    /// - Query parameters and JSON body fields merge into options (body wins on
+    ///   conflict).
+    /// - Streaming results are buffered into an array (NDJSON streaming is not
+    ///   supported here; consumers wanting streaming should call the stream
+    ///   handler directly).
+    /// - Returns a `FetchResponse` carrying status, headers, and a JSON body
+    ///   following the standard `{ok, data|error, meta}` envelope.
+    public func fetch(_ request: URLRequest) async -> FetchResponse {
+        let start = ContinuousClock.now
+        let url = request.url
+        let pathStr = url?.path ?? "/"
+        let queryStr = url?.query ?? ""
+
+        // Tokenise the path
+        let pathSegments = pathStr
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map(String.init)
+
+        // Resolve through the command tree
+        let resolved = resolveFetchCommand(
+            commands: commands,
+            tokens: pathSegments,
+            rootCommand: rootCommand,
+            cliName: name
+        )
+
+        // Parse query params
+        let queryParams = parseQueryString(queryStr)
+
+        // Parse body if JSON
+        var bodyParams = OrderedMap()
+        if let body = request.httpBody, !body.isEmpty {
+            if let parsed = JSONValue.parse(String(data: body, encoding: .utf8) ?? ""),
+               case .object(let map) = parsed {
+                bodyParams = map
+            }
+        }
+
+        let elapsedMs: () -> String = {
+            let elapsed = ContinuousClock.now - start
+            let ms = Int(elapsed.components.seconds * 1000 + elapsed.components.attoseconds / 1_000_000_000_000_000)
+            return "\(ms)ms"
+        }
+
+        switch resolved {
+        case .leaf(let command, let path, let trailingArgs):
+            return await runFetchLeaf(
+                command: command,
+                commandPath: path,
+                trailingArgs: trailingArgs,
+                queryParams: queryParams,
+                bodyParams: bodyParams,
+                middleware: middlewareHandlers,
+                duration: elapsedMs
+            )
+
+        case .gateway(let handler, let opts, let path):
+            // Forward the original Request via curl-style path
+            let basePath = opts.basePath ?? ""
+            let forwardPath: String
+            if pathSegments.count > path.split(separator: " ").count {
+                let trailing = Array(pathSegments.dropFirst(path.split(separator: " ").count))
+                forwardPath = basePath + "/" + trailing.joined(separator: "/")
+            } else {
+                forwardPath = basePath + (pathStr.isEmpty ? "/" : pathStr)
+            }
+            let input = FetchInput(
+                path: forwardPath,
+                method: request.httpMethod ?? "GET",
+                headers: (request.allHTTPHeaderFields ?? [:]).map { ($0.key, $0.value) },
+                body: request.httpBody.flatMap { String(data: $0, encoding: .utf8) }
+            )
+            let output = await handler.handle(input)
+            let body: JSONValue = [
+                "ok": .bool(output.ok),
+                "data": output.data,
+                "meta": [
+                    "command": .string(path),
+                    "duration": .string(elapsedMs()),
+                ],
+            ]
+            return FetchResponse(status: output.status, headers: ["content-type": "application/json"], body: body)
+
+        case .notFound(let attempted):
+            let body: JSONValue = [
+                "ok": false,
+                "error": [
+                    "code": .string("COMMAND_NOT_FOUND"),
+                    "message": .string("'\(attempted)' is not a command for '\(name)'."),
+                ],
+                "meta": [
+                    "command": .string(attempted),
+                    "duration": .string(elapsedMs()),
+                ],
+            ]
+            return FetchResponse(status: 404, headers: ["content-type": "application/json"], body: body)
+
+        case .noRoot:
+            let body: JSONValue = [
+                "ok": false,
+                "error": [
+                    "code": .string("COMMAND_NOT_FOUND"),
+                    "message": .string("No root command defined."),
+                ],
+                "meta": [
+                    "command": .string("/"),
+                    "duration": .string(elapsedMs()),
+                ],
+            ]
+            return FetchResponse(status: 404, headers: ["content-type": "application/json"], body: body)
+        }
+    }
+
+    private func runFetchLeaf(
+        command: CommandDef,
+        commandPath: String,
+        trailingArgs: [String],
+        queryParams: OrderedMap,
+        bodyParams: OrderedMap,
+        middleware: [MiddlewareFn],
+        duration: () -> String
+    ) async -> FetchResponse {
+        // Merge: body wins over query
+        var inputOptions = queryParams
+        for (key, value) in bodyParams {
+            inputOptions[key] = value
+        }
+
+        let envSource = ProcessInfo.processInfo.environment
+
+        let result = await execute(
+            command: command,
+            options: ExecuteOptions(
+                agent: true,
+                argv: trailingArgs,
+                envFields: envFields,
+                envSource: envSource,
+                format: .json,
+                formatExplicit: true,
+                inputOptions: inputOptions,
+                middlewares: middleware + command.middleware,
+                name: name,
+                parseMode: .split,
+                path: commandPath,
+                varsFields: varsFields,
+                version: version
+            )
+        )
+
+        switch result {
+        case .ok(let data, _):
+            let body: JSONValue = [
+                "ok": true,
+                "data": data,
+                "meta": [
+                    "command": .string(commandPath),
+                    "duration": .string(duration()),
+                ],
+            ]
+            return FetchResponse(status: 200, headers: ["content-type": "application/json"], body: body)
+
+        case .error(let code, let message, let retryable, _, _, _):
+            let status: Int = (code == "VALIDATION_ERROR") ? 400 : 500
+            var errorObj: OrderedMap = [
+                "code": .string(code),
+                "message": .string(message),
+            ]
+            if let retryable {
+                errorObj["retryable"] = .bool(retryable)
+            }
+            let body: JSONValue = [
+                "ok": false,
+                "error": .object(errorObj),
+                "meta": [
+                    "command": .string(commandPath),
+                    "duration": .string(duration()),
+                ],
+            ]
+            return FetchResponse(status: status, headers: ["content-type": "application/json"], body: body)
+
+        case .stream(let stream):
+            var chunks: [JSONValue] = []
+            for await chunk in stream {
+                chunks.append(chunk)
+            }
+            let body: JSONValue = [
+                "ok": true,
+                "data": .array(chunks),
+                "meta": [
+                    "command": .string(commandPath),
+                    "duration": .string(duration()),
+                ],
+            ]
+            return FetchResponse(status: 200, headers: ["content-type": "application/json"], body: body)
+        }
+    }
+
     // MARK: - Help Formatting
 
     private func formatLeafCommandHelp(_ command: CommandDef, isRoot: Bool) -> String {
@@ -714,6 +1041,7 @@ public final class Cli: @unchecked Sendable {
                 description: command.description,
                 envFields: command.envFields,
                 examples: command.examples,
+                usage: command.usage,
                 hint: command.hint,
                 optionsFields: command.optionsFields,
                 optionAliases: command.aliases,
@@ -988,6 +1316,29 @@ func outputResult(
         Foundation.exit(exitCode ?? 1)
 
     case .stream(let stream):
+        // When --filter-output is supplied, buffer the stream so the filter
+        // (and any subsequent token operations) can apply to the assembled
+        // result. This mirrors the upstream TS Cli, which falls into the
+        // buffered-output branch whenever an explicit non-JSONL format is
+        // requested or filtering must be applied to a coherent tree.
+        if let expr = filterExpr {
+            var chunks: [JSONValue] = []
+            for await item in stream {
+                chunks.append(item)
+            }
+            let filtered = applyFilter(data: .array(chunks), paths: parseFilterExpression(expr))
+            var formatted = formatValue(filtered, format: format)
+            if tokenCount || tokenLimit != nil || tokenOffset != nil {
+                formatted = applyTokenOperations(
+                    formatted,
+                    count: tokenCount,
+                    limit: tokenLimit,
+                    offset: tokenOffset
+                )
+            }
+            writelnStdout(formatted)
+            return
+        }
         // Consume stream, outputting each item
         for await item in stream {
             let formatted = formatValue(item, format: format == .toon ? .jsonl : format)
@@ -998,40 +1349,48 @@ func outputResult(
 
 /// Applies token counting, limiting, and offsetting to formatted output.
 ///
-/// Approximates tokens as `characterCount / 4`.
+/// Uses the `tokenx`-style heuristic from `Pager.swift`'s `estimateTokenCount`
+/// and `sliceByTokens`. When truncating, appends a
+/// `[truncated: showing tokens A-B of N]` summary line, matching the TS impl.
 func applyTokenOperations(
     _ text: String,
     count: Bool,
     limit: Int?,
     offset: Int?
 ) -> String {
-    let totalTokens = text.count / 4
-
     if count {
-        return String(totalTokens)
+        return String(estimateTokenCount(text))
     }
+    let result = truncateByTokens(text, limit: limit, offset: offset)
+    return result.text
+}
 
-    // Apply offset and limit by character approximation
-    var result = text
+/// Result of `truncateByTokens` — the truncated text, whether truncation
+/// occurred, and the next offset to use for pagination (if any).
+struct TokenTruncation {
+    let text: String
+    let truncated: Bool
+    let nextOffset: Int?
+}
 
-    if let offset, offset > 0 {
-        let charOffset = offset * 4
-        if charOffset >= result.count {
-            return ""
-        }
-        let startIndex = result.index(result.startIndex, offsetBy: charOffset)
-        result = String(result[startIndex...])
+/// Applies offset/limit pagination to `text` using the tokenx heuristic.
+/// Returns the original text untouched when no offset/limit are set, or when
+/// the requested window already covers the full text.
+func truncateByTokens(_ text: String, limit: Int?, offset: Int?) -> TokenTruncation {
+    if limit == nil && offset == nil {
+        return TokenTruncation(text: text, truncated: false, nextOffset: nil)
     }
-
-    if let limit, limit > 0 {
-        let charLimit = limit * 4
-        if charLimit < result.count {
-            let endIndex = result.index(result.startIndex, offsetBy: charLimit)
-            result = String(result[..<endIndex])
-        }
+    let total = estimateTokenCount(text)
+    let off = max(0, offset ?? 0)
+    let end = limit != nil ? off + max(0, limit!) : total
+    if off == 0 && end >= total {
+        return TokenTruncation(text: text, truncated: false, nextOffset: nil)
     }
-
-    return result
+    let sliced = sliceByTokens(text, start: off, end: end)
+    let actualEnd = min(end, total)
+    let nextOffset = actualEnd < total ? actualEnd : nil
+    let suffix = "\n[truncated: showing tokens \(off)-\(actualEnd) of \(total)]"
+    return TokenTruncation(text: sliced + suffix, truncated: true, nextOffset: nextOffset)
 }
 
 // MARK: - Helpers

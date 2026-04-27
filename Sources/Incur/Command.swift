@@ -32,6 +32,35 @@ public struct Example: Sendable {
     }
 }
 
+/// An alternative usage pattern shown in help output, ported from the TS
+/// `Usage<args, options>` type. Each entry renders as a fully-formed command
+/// line in the synopsis section: `<prefix> <name> <args...> <--options...> <suffix>`.
+public struct Usage: Sendable {
+    /// Positional argument values to include in the rendered command line.
+    /// Keys are arg names (in registration order via `OrderedMap`); values are
+    /// rendered as literal CLI tokens. Strings containing whitespace are
+    /// double-quoted, all other JSON scalars are emitted verbatim.
+    public let args: OrderedMap
+    /// Named option values to include. Rendered as `--cli-name <value>`.
+    public let options: OrderedMap
+    /// Text prepended before the command (e.g. `"cat file.txt |"`).
+    public let prefix: String?
+    /// Text appended after the command (e.g. `"| head"`).
+    public let suffix: String?
+
+    public init(
+        args: OrderedMap = OrderedMap(),
+        options: OrderedMap = OrderedMap(),
+        prefix: String? = nil,
+        suffix: String? = nil
+    ) {
+        self.args = args
+        self.options = options
+        self.prefix = prefix
+        self.suffix = suffix
+    }
+}
+
 /// Trait for command handlers.
 public protocol CommandHandler: Sendable {
     /// Execute the command with the given context.
@@ -54,6 +83,8 @@ public final class CommandDef: @unchecked Sendable {
     public let aliases: [String: Character]
     /// Usage examples displayed in help output.
     public let examples: [Example]
+    /// Alternative usage patterns rendered in the synopsis section of `--help`.
+    public let usage: [Usage]
     /// Plain-text hint displayed after examples in help output.
     public let hint: String?
     /// Default output format for this command.
@@ -75,6 +106,7 @@ public final class CommandDef: @unchecked Sendable {
         envFields: [FieldMeta] = [],
         aliases: [String: Character] = [:],
         examples: [Example] = [],
+        usage: [Usage] = [],
         hint: String? = nil,
         format: Format? = nil,
         outputPolicy: OutputPolicy? = nil,
@@ -89,6 +121,7 @@ public final class CommandDef: @unchecked Sendable {
         self.envFields = envFields
         self.aliases = aliases
         self.examples = examples
+        self.usage = usage
         self.hint = hint
         self.format = format
         self.outputPolicy = outputPolicy
@@ -112,6 +145,7 @@ public final class CommandBuilder {
     private var _envFields: [FieldMeta] = []
     private var _aliases: [String: Character] = [:]
     private var _examples: [Example] = []
+    private var _usage: [Usage] = []
     private var _hint: String?
     private var _format: Format?
     private var _outputPolicy: OutputPolicy?
@@ -127,6 +161,7 @@ public final class CommandBuilder {
         _envFields = def.envFields
         _aliases = def.aliases
         _examples = def.examples
+        _usage = def.usage
         _hint = def.hint
         _format = def.format
         _outputPolicy = def.outputPolicy
@@ -165,6 +200,11 @@ public final class CommandBuilder {
         return self
     }
 
+    public func usage(_ usage: [Usage]) -> CommandBuilder {
+        _usage = usage
+        return self
+    }
+
     public func hint(_ hint: String) -> CommandBuilder {
         _hint = hint
         return self
@@ -184,6 +224,7 @@ public final class CommandBuilder {
             envFields: _envFields,
             aliases: _aliases,
             examples: _examples,
+            usage: _usage,
             hint: _hint,
             format: _format,
             outputPolicy: _outputPolicy,
@@ -252,6 +293,7 @@ public struct ExecuteOptions: Sendable {
     public let name: String
     public let parseMode: ParseMode
     public let path: String
+    public let varsFields: [FieldMeta]
     public let version: String?
 
     public init(
@@ -267,6 +309,7 @@ public struct ExecuteOptions: Sendable {
         name: String = "",
         parseMode: ParseMode = .argv,
         path: String = "",
+        varsFields: [FieldMeta] = [],
         version: String? = nil
     ) {
         self.agent = agent
@@ -281,6 +324,7 @@ public struct ExecuteOptions: Sendable {
         self.name = name
         self.parseMode = parseMode
         self.path = path
+        self.varsFields = varsFields
         self.version = version
     }
 }
@@ -295,6 +339,13 @@ public enum InternalResult: Sendable {
 /// Unified command execution used by CLI, HTTP, and MCP transports.
 public func execute(command: CommandDef, options: ExecuteOptions) async -> InternalResult {
     let varsMap = MutableVars()
+
+    // Seed vars defaults from the schema (mirrors TS `varsSchema.parse({})`).
+    for field in options.varsFields {
+        if let defaultValue = field.defaultValue {
+            varsMap[field.name] = defaultValue
+        }
+    }
 
     // Parse args and options based on parseMode
     let args: JSONValue
@@ -331,16 +382,54 @@ public func execute(command: CommandDef, options: ExecuteOptions) async -> Inter
         parsedOptions = result.1
     }
 
-    // Parse command env from envSource
-    let commandEnv = parseEnvFields(command.envFields, source: options.envSource)
+    // Parse + validate CLI-level env (runs BEFORE middleware so required vars
+    // and type coercion failures fail fast). Mirrors TS `Parser.parseEnv`
+    // being invoked at serve start before the middleware chain executes.
+    let cliEnvResult = parseAndValidateEnv(options.envFields, source: options.envSource)
+    let commandEnvResult = parseAndValidateEnv(command.envFields, source: options.envSource)
 
-    // Parse CLI-level env
-    let cliEnv = parseEnvFields(options.envFields, source: options.envSource)
+    let allEnvErrors = cliEnvResult.errors + commandEnvResult.errors
+    if !allEnvErrors.isEmpty {
+        let summary = allEnvErrors.count == 1
+            ? allEnvErrors[0].message
+            : "Env validation failed: \(allEnvErrors.count) error(s)"
+        return .error(
+            code: "VALIDATION_ERROR",
+            message: summary,
+            retryable: nil,
+            fieldErrors: allEnvErrors,
+            cta: nil,
+            exitCode: 1
+        )
+    }
+
+    // CLI-level env reaches middleware; the handler sees CLI env merged with
+    // command-level env (command-level wins on key conflict).
+    let cliEnv = JSONValue.object(cliEnvResult.values)
+    var mergedEnv = cliEnvResult.values
+    for (key, value) in commandEnvResult.values {
+        mergedEnv[key] = value
+    }
+    let commandEnv = JSONValue.object(mergedEnv)
 
     // Shared result slot (actor for Sendable safety)
     let resultSlot = ResultSlot()
 
     let runCommand: @Sendable () async -> Void = {
+        // Validate vars against the declared schema (defaults already seeded;
+        // middleware has run any pre-handler hooks). Mirrors TS `varsSchema.parse`.
+        if let validationError = validateVars(options.varsFields, vars: varsMap.snapshotMap()) {
+            await resultSlot.set(.error(
+                code: "VALIDATION_ERROR",
+                message: validationError.message,
+                retryable: nil,
+                fieldErrors: validationError.fieldErrors,
+                cta: nil,
+                exitCode: 1
+            ))
+            return
+        }
+
         // Build CommandContext with current vars snapshot
         let ctx = CommandContext(
             agent: options.agent,
@@ -479,6 +568,76 @@ private func parseEnvFields(_ envFields: [FieldMeta], source: [String: String]) 
     return .object(envMap)
 }
 
+/// Result of parsing + validating an env schema against a process env source.
+struct EnvParseResult {
+    let values: OrderedMap
+    let errors: [FieldError]
+}
+
+/// Parses the given env fields out of `source`, applying defaults and coercion.
+/// Required-but-missing fields and type-coercion failures are returned as
+/// `FieldError`s with `path: "env.<name>"` so callers can surface them as a
+/// `VALIDATION_ERROR` with field-level detail. Mirrors the TS
+/// `Parser.parseEnv` + Zod validation pipeline at the CLI scope.
+func parseAndValidateEnv(_ envFields: [FieldMeta], source: [String: String]) -> EnvParseResult {
+    var values = OrderedMap()
+    var errors: [FieldError] = []
+    for field in envFields {
+        let envName = field.envName ?? field.name
+        if let raw = source[envName] {
+            switch coerceEnvValue(raw, fieldType: field.fieldType) {
+            case .success(let v):
+                values[field.name] = v
+            case .failure(let received):
+                errors.append(FieldError(
+                    path: "env.\(field.name)",
+                    expected: field.fieldType.displayName,
+                    received: received,
+                    message: "Env var '\(envName)' expected \(field.fieldType.displayName) but got \"\(raw)\""
+                ))
+            }
+        } else if let defaultValue = field.defaultValue {
+            values[field.name] = defaultValue
+        } else if field.required {
+            errors.append(FieldError(
+                path: "env.\(field.name)",
+                expected: field.fieldType.displayName,
+                received: "undefined",
+                message: "Required env var '\(envName)' was not set"
+            ))
+        }
+    }
+    return EnvParseResult(values: values, errors: errors)
+}
+
+private enum EnvCoercion {
+    case success(JSONValue)
+    case failure(String)
+}
+
+/// Coerces a raw env-var string to the declared field type, returning a
+/// `.failure` for typed fields whose value cannot be parsed (e.g. `LOG_LEVEL=oops`
+/// for `.number`). Boolean parsing accepts `1/0/true/false/yes/no`.
+private func coerceEnvValue(_ value: String, fieldType: FieldType) -> EnvCoercion {
+    switch fieldType {
+    case .boolean:
+        switch value {
+        case "1", "true", "yes": return .success(.bool(true))
+        case "0", "false", "no": return .success(.bool(false))
+        default: return .failure("string")
+        }
+    case .number, .count:
+        if let i = Int(value) { return .success(.int(i)) }
+        if let d = Double(value), d.isFinite { return .success(.double(d)) }
+        return .failure("string")
+    case .enum(let allowed):
+        if allowed.contains(value) { return .success(.string(value)) }
+        return .failure("string")
+    case .array, .string, .value:
+        return .success(.string(value))
+    }
+}
+
 private func parseEnvValue(_ value: String, fieldType: FieldType) -> JSONValue {
     switch fieldType {
     case .boolean:
@@ -493,6 +652,78 @@ private func parseEnvValue(_ value: String, fieldType: FieldType) -> JSONValue {
         return .string(value)
     default:
         return .string(value)
+    }
+}
+
+/// Validates middleware-populated variables against the declared schema.
+/// Returns a `ValidationError` describing missing required fields or type
+/// mismatches, or `nil` if validation passes. Mirrors `varsSchema.parse({})`
+/// in the TS implementation, where Zod runs over the merged defaults +
+/// middleware-set values before the handler reads them.
+public func validateVars(_ fields: [FieldMeta], vars: OrderedMap) -> ValidationError? {
+    var errors: [FieldError] = []
+    for field in fields {
+        guard let value = vars[field.name] else {
+            if field.required {
+                errors.append(FieldError(
+                    path: "vars.\(field.name)",
+                    expected: field.fieldType.displayName,
+                    received: "undefined",
+                    message: "Required variable '\(field.name)' was not set"
+                ))
+            }
+            continue
+        }
+        if !varValueMatches(value, fieldType: field.fieldType) {
+            errors.append(FieldError(
+                path: "vars.\(field.name)",
+                expected: field.fieldType.displayName,
+                received: jsonValueTypeName(value),
+                message: "Variable '\(field.name)' expected \(field.fieldType.displayName) but got \(jsonValueTypeName(value))"
+            ))
+        }
+    }
+    if errors.isEmpty { return nil }
+    let summary = errors.count == 1
+        ? errors[0].message
+        : "Vars validation failed: \(errors.count) error(s)"
+    return ValidationError(message: summary, fieldErrors: errors)
+}
+
+private func varValueMatches(_ value: JSONValue, fieldType: FieldType) -> Bool {
+    switch fieldType {
+    case .string:
+        if case .string = value { return true }
+        return false
+    case .number:
+        if case .int = value { return true }
+        if case .double = value { return true }
+        return false
+    case .boolean:
+        if case .bool = value { return true }
+        return false
+    case .array(let inner):
+        guard case .array(let items) = value else { return false }
+        return items.allSatisfy { varValueMatches($0, fieldType: inner) }
+    case .enum(let allowed):
+        guard case .string(let s) = value else { return false }
+        return allowed.contains(s)
+    case .count:
+        if case .int = value { return true }
+        return false
+    case .value:
+        return true
+    }
+}
+
+private func jsonValueTypeName(_ value: JSONValue) -> String {
+    switch value {
+    case .null: return "null"
+    case .bool: return "boolean"
+    case .int, .double: return "number"
+    case .string: return "string"
+    case .array: return "array"
+    case .object: return "object"
     }
 }
 

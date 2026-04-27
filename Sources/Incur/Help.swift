@@ -51,6 +51,7 @@ public struct FormatCommandOptions: Sendable {
     public let description: String?
     public let envFields: [FieldMeta]
     public let examples: [Example]
+    public let usage: [Usage]
     public let hint: String?
     public let hideGlobalOptions: Bool
     public let optionsFields: [FieldMeta]
@@ -66,6 +67,7 @@ public struct FormatCommandOptions: Sendable {
         description: String? = nil,
         envFields: [FieldMeta] = [],
         examples: [Example] = [],
+        usage: [Usage] = [],
         hint: String? = nil,
         hideGlobalOptions: Bool = false,
         optionsFields: [FieldMeta] = [],
@@ -80,6 +82,7 @@ public struct FormatCommandOptions: Sendable {
         self.description = description
         self.envFields = envFields
         self.examples = examples
+        self.usage = usage
         self.hint = hint
         self.hideGlobalOptions = hideGlobalOptions
         self.optionsFields = optionsFields
@@ -145,10 +148,19 @@ public func formatCommandHelp(name: String, options: FormatCommandOptions) -> St
     lines.append("")
 
     // Synopsis
-    let synopsis = buildSynopsis(name: name, argsFields: options.argsFields)
-    let optionsSuffix = options.optionsFields.isEmpty ? "" : " [options]"
-    let commandsSuffix = options.commands.isEmpty ? "" : " | <command>"
-    lines.append("Usage: \(synopsis)\(optionsSuffix)\(commandsSuffix)")
+    if !options.usage.isEmpty {
+        let usageLines = options.usage.map { renderUsageLine(name: name, usage: $0, optionsFields: options.optionsFields) }
+        let pad = String(repeating: " ", count: "Usage: ".count)
+        lines.append("Usage: \(usageLines[0])")
+        for line in usageLines.dropFirst() {
+            lines.append("\(pad)\(line)")
+        }
+    } else {
+        let synopsis = buildSynopsis(name: name, argsFields: options.argsFields)
+        let optionsSuffix = options.optionsFields.isEmpty ? "" : " [options]"
+        let commandsSuffix = options.commands.isEmpty ? "" : " | <command>"
+        lines.append("Usage: \(synopsis)\(optionsSuffix)\(commandsSuffix)")
+    }
     if let aliases = options.aliases, !aliases.isEmpty {
         lines.append("Aliases: \(aliases.joined(separator: ", "))")
     }
@@ -293,6 +305,57 @@ public func formatCommandHelp(name: String, options: FormatCommandOptions) -> St
 }
 
 // MARK: - Internal helpers
+
+/// Renders a single `Usage` entry as a CLI command line for the synopsis section.
+/// Mirrors the TS `formatCommand` usage rendering: `<prefix> name <args...> --opt <opt>... <suffix>`.
+/// Argument values are emitted as literal CLI tokens; strings containing whitespace
+/// are double-quoted. The TS implementation only supports `Record<string, true>`
+/// (placeholder rendering as `<name>`); the Swift port additionally supports
+/// concrete `JSONValue` payloads.
+private func renderUsageLine(name: String, usage: Usage, optionsFields: [FieldMeta]) -> String {
+    var parts: [String] = []
+    if let prefix = usage.prefix, !prefix.isEmpty {
+        parts.append(prefix)
+    }
+    parts.append(name)
+    for (key, value) in usage.args {
+        parts.append(renderUsageToken(key: key, value: value, asArg: true))
+    }
+    let cliNameByName = Dictionary(uniqueKeysWithValues: optionsFields.map { ($0.name, $0.cliName) })
+    for (key, value) in usage.options {
+        let cliName = cliNameByName[key] ?? key
+        parts.append("--\(cliName)")
+        parts.append(renderUsageToken(key: key, value: value, asArg: false))
+    }
+    if let suffix = usage.suffix, !suffix.isEmpty {
+        parts.append(suffix)
+    }
+    return parts.joined(separator: " ")
+}
+
+/// Renders a single arg/option value as a CLI token. Booleans `true` and JSON
+/// `null` collapse to a placeholder `<key>` (matching TS `Record<key, true>`
+/// semantics); concrete values are emitted verbatim, with whitespace-bearing
+/// strings double-quoted.
+private func renderUsageToken(key: String, value: JSONValue, asArg: Bool) -> String {
+    switch value {
+    case .bool(true), .null:
+        return asArg ? "<\(key)>" : "<\(key)>"
+    case .bool(false):
+        return "false"
+    case .int(let i):
+        return String(i)
+    case .double(let d):
+        return String(d)
+    case .string(let s):
+        if s.contains(where: { $0.isWhitespace }) {
+            return "\"\(s)\""
+        }
+        return s
+    case .array, .object:
+        return value.toJSON(pretty: false)
+    }
+}
 
 /// Builds the synopsis string with `<required>` and `[optional]` placeholders.
 private func buildSynopsis(name: String, argsFields: [FieldMeta]) -> String {
