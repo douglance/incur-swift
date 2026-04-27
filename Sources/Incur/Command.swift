@@ -97,6 +97,11 @@ public final class CommandDef: @unchecked Sendable {
     public let middleware: [MiddlewareFn]
     /// JSON Schema for the command's output type.
     public let outputSchema: JSONValue?
+    /// Additional voice-recognition phrases that map to this command.
+    /// Purely additive — used by voice phrase map builders to cover phrasings
+    /// that the standard derivation rules (canonical name, description-derived,
+    /// bare-noun) cannot synthesize. Has no effect on parsing or help output.
+    public let voicePhrases: [String]
 
     public init(
         name: String,
@@ -112,7 +117,8 @@ public final class CommandDef: @unchecked Sendable {
         outputPolicy: OutputPolicy? = nil,
         handler: any CommandHandler,
         middleware: [MiddlewareFn] = [],
-        outputSchema: JSONValue? = nil
+        outputSchema: JSONValue? = nil,
+        voicePhrases: [String] = []
     ) {
         self.name = name
         self.description = description
@@ -128,6 +134,7 @@ public final class CommandDef: @unchecked Sendable {
         self.handler = handler
         self.middleware = middleware
         self.outputSchema = outputSchema
+        self.voicePhrases = voicePhrases
     }
 
     /// Creates a new command builder with the given name and handler.
